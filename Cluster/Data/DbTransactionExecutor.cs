@@ -57,8 +57,9 @@ public static class DbTransactionExecutor
 
                 // 1. Пытаемся взять неблокирующую рекомендательную транзакционную блокировку.
                 // Возвращает true, если залочено успешно, или false, если ключ занят другим процессом ПРЯМО СЕЙЧАС.
+                // Обратите внимание на добавленное: AS "Value" в конце SQL-запроса!
                 var isLocked = await context.Database
-                    .SqlQuery<bool>($"SELECT pg_try_advisory_xact_lock(hashtextextended({idempotencyKey.ToString("D")}, 0))")
+                    .SqlQuery<bool>($"SELECT pg_try_advisory_xact_lock(hashtextextended({idempotencyKey.ToString("D")}, 0)) AS \"Value\"")
                     .SingleAsync(ct);
 
                 if (!isLocked)
@@ -80,7 +81,9 @@ public static class DbTransactionExecutor
                 if (existing is not null)
                 {
                     // Если результат уже записан, просто отдаем его (идеальный сценарий повтора от клиента)
-                    if (!string.IsNullOrWhiteSpace(existing.ResultJson))
+
+                    if (!string.IsNullOrWhiteSpace(existing.ResultJson) &&
+                        existing.ResultJson != "{}" && existing.ResultJson != "[]")
                     {
                         logger.LogInformation(
                             "Idempotent result returned from cache. Key: {Key}", 
@@ -115,8 +118,11 @@ public static class DbTransactionExecutor
                     {
                         IdempotencyKey = idempotencyKey,
                         ExecutionId = executionId,
-                        ResultJson = string.Empty, // пока пусто
-                        CreatedAtUtc = DateTime.UtcNow
+                        ResultJson = null,
+                        CreatedAtUtc = DateTime.UtcNow,
+                        MessageType = null,
+                        MessagePayloadJson = null,
+                        IsPublished = false
                     };
                     context.Set<TransactionOperation>().Add(draft);
                     await context.SaveChangesAsync(ct);
@@ -136,8 +142,8 @@ public static class DbTransactionExecutor
                 var recordToUpdate = context.ChangeTracker.Entries<TransactionOperation>()
                     .Select(e => e.Entity)
                     .FirstOrDefault(x => x.IdempotencyKey == idempotencyKey)
-                    ?? await context.Set<TransactionOperation>()
-                        .SingleAsync(x => x.IdempotencyKey == idempotencyKey, ct);
+                        ?? await context.Set<TransactionOperation>()
+                            .SingleAsync(x => x.IdempotencyKey == idempotencyKey, ct);
 
                 recordToUpdate.ResultJson = json;
                 recordToUpdate.CreatedAtUtc = DateTime.UtcNow; // обновляем время завершения

@@ -1,7 +1,10 @@
 using Cluster.Data;
+using Cluster.Messaging.Handlers;
 using Cluster.Messaging.Kafka;
+using Confluent.Kafka;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -81,11 +84,32 @@ builder.Services.AddDataProtection()
 builder.Services
     .AddOptions<KafkaOptions>()
     .Bind(builder.Configuration.GetSection(KafkaOptions.SectionName))
-    .Validate(x => !string.IsNullOrWhiteSpace(x.BootstrapServers),
-        "Kafka BootstrapServers is required.")
+    .Validate(x => !string.IsNullOrWhiteSpace(x.BootstrapServers), "Kafka BootstrapServers is required.")
     .ValidateOnStart();
 
 builder.Services.AddSingleton<KafkaProducer>();
+
+// 1. Регистрируем Реестр обработчиков
+builder.Services.AddSingleton<DomainEventHandlerRegistry>();
+
+// 2. Автоматически регистрируем ВСЕ классы, реализующие IDomainEventHandler
+// (Если не используете Scrutor, можно добавить их вручную по одному)
+builder.Services.Scan(scan => scan
+    .FromAssemblyOf<Program>()
+    .AddClasses(classes => classes.AssignableTo<IDomainEventHandler>())
+    .AsImplementedInterfaces()
+    .WithSingletonLifetime());
+
+// 2. Регистрируем обработчики вручную
+//builder.Services.AddSingleton<CustomerCreatedHandler>();
+// В будущем добавляйте новые обработчики здесь:
+// builder.Services.AddSingleton<AnotherEventHandler>();
+
+// 3. Регистрируем ЕДИНЫЙ фоновый воркер
+builder.Services.AddHostedService<DomainEventsWorker>();
+
+// Регистрируем фоновый процесс доставки событий из БД в Kafka
+builder.Services.AddHostedService<DomainEventsPublisherWorker>();
 
 builder.Services.AddMediatR(cfg =>
     cfg.RegisterServicesFromAssembly(typeof(Program).Assembly));
@@ -116,5 +140,34 @@ app.MapControllerRoute(
     pattern: "{controller=Home}/{action=Index}/{id?}")
     .WithStaticAssets();
 
+await EnsureKafkaTopicExistsAsync(app.Services);
 
 app.Run();
+
+static async Task EnsureKafkaTopicExistsAsync(IServiceProvider services)
+{
+    var options = services.GetRequiredService<IOptions<KafkaOptions>>().Value;
+    using var adminClient = new AdminClientBuilder(new AdminClientConfig
+    {
+        BootstrapServers = options.BootstrapServers
+    }).Build();
+
+    try
+    {
+        await adminClient.CreateTopicsAsync(
+        [
+            new Confluent.Kafka.Admin.TopicSpecification
+            {
+                Name = options.Topic,
+                NumPartitions = 4, // Оптимально для 2 узлов (можно масштабировать до 4-8 воркеров)
+                ReplicationFactor = 2
+            }
+        ]);
+        Console.WriteLine($"Топик '{options.Topic}' создан или уже существует.");
+    }
+    catch (Confluent.Kafka.Admin.CreateTopicsException e)
+    {
+        if (!e.Results.All(r => r.Error.Code == Confluent.Kafka.ErrorCode.TopicAlreadyExists))
+            throw;
+    }
+}
