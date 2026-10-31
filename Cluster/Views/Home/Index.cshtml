@@ -1,0 +1,23 @@
+﻿@{
+    ViewData["Title"] = "Home Page";
+}
+
+<div class="text-center">
+    <h1 class="display-4">Welcome</h1>
+    <p>Learn about <a href="https://learn.microsoft.com/aspnet/core">building Web apps with ASP.NET Core</a>.</p>
+</div>
+
+<div class="text-center" style="margin-top: 50px;">
+    <h2>Тестирование распределенного хранилища CRM</h2>
+    <p>Файл загрузится на любую ноду Swarm, запишется на СХД-2, а Nginx отдаст его напрямую.</p>
+
+    <!-- Форма отправки файла -->
+    <form asp-action="UploadFile" asp-controller="Home" method="post" enctype="multipart/form-data" style="margin: 30px auto; max-width: 400px; padding: 20px; border: 1px solid #ccc; border-radius: 8px;">
+        <div style="margin-bottom: 15px;">
+            <input type="file" name="file" class="form-control" required />
+        </div>
+        <button type="submit" style="background-color: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer;">
+            Загрузить файл в кластер
+        </button>
+    </form>
+</div>

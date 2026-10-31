@@ -1,0 +1,59 @@
+# Сборка
+docker build -t cluster:latest -f Cluster/Dockerfile .
+
+# Экспорт созданного образа
+docker save -o cluster-app.tar cluster:latest
+
+# Перенос на менеджер
+scp cluster-app.tar ubuntu@192.168.10.101:/home/ubuntu/
+
+# Перенос на воркер
+scp cluster-app.tar ubuntu@192.168.10.102:/home/ubuntu/
+
+# Выполнить на виртуалках
+sudo docker load -i /home/ubuntu/cluster-app.tar
+
+nano docker-compose.prod.yml
+
+version: '3.8'
+
+services:
+  crm_web:
+    image: cluster:latest # Имя вашего загруженного .NET образа
+    ports:
+      - "8080:8080" # Открываем порт 8080 наружу на всех нодах кластера
+    networks:
+      - crm_net
+    deploy:
+      replicas: 4 # Запускаем 4 копии приложения (поровну на менеджер и воркер)
+      resources:
+        limits:
+          cpus: '0.5' # Ограничение: пол-ядра на один контейнер
+          memory: 512M
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+      restart_policy:
+        condition: on-failure
+
+networks:
+  crm_net:
+    driver: overlay # Overlay-сеть объединяет контейнеры на разных VM в единую сеть
+
+# Сохранение файла
+
+1. Нажмите комбинацию клавиш Ctrl + O (для записи файла).
+2. Нажмите Enter (для подтверждения имени файла).
+3. Нажмите Ctrl + X (для выхода из редактора nano).
+
+# Запуск приложения в кластере Swarm
+sudo docker stack deploy -c docker-compose.prod.yml my-mvc-app
+
+# Проверка
+sudo docker stack ps my-mvc-app
+
+# Перебалансировка
+sudo docker service update --force my-mvc-app_crm_web
+
+

@@ -1,0 +1,26 @@
+﻿@model CreateCustomerViewModel
+
+@{
+    ViewData["Title"] = "Добавить клиента";
+}
+
+<h1>Добавить клиента</h1>
+
+<form asp-action="Create" method="post">
+    <div asp-validation-summary="ModelOnly" class="text-danger"></div>
+    <input asp-for="IdempotencyKey" type="hidden" />
+    <div class="mb-3">
+        <label asp-for="Name" class="form-label">Имя</label>
+        <input asp-for="Name" class="form-control" />
+        <span asp-validation-for="Name" class="text-danger"></span>
+    </div>
+
+    <div class="mb-3">
+        <label asp-for="Email" class="form-label">Email</label>
+        <input asp-for="Email" class="form-control" />
+        <span asp-validation-for="Email" class="text-danger"></span>
+    </div>
+
+    <button type="submit" class="btn btn-primary">Сохранить</button>
+    <a asp-action="Index" class="btn btn-secondary">Назад</a>
+</form>
