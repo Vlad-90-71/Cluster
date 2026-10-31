@@ -5,55 +5,67 @@ docker build -t cluster:latest -f Cluster/Dockerfile .
 docker save -o cluster-app.tar cluster:latest
 
 # Перенос на менеджер
-scp cluster-app.tar ubuntu@192.168.10.101:/home/ubuntu/
-
-# Перенос на воркер
-scp cluster-app.tar ubuntu@192.168.10.102:/home/ubuntu/
+scp cluster-app.tar ubuntu@192.168.10.12:/home/ubuntu/
 
 # Выполнить на виртуалках
 sudo docker load -i /home/ubuntu/cluster-app.tar
 
-nano docker-compose.prod.yml
-
-version: '3.8'
-
-services:
-  crm_web:
-    image: cluster:latest # Имя вашего загруженного .NET образа
-    ports:
-      - "8080:8080" # Открываем порт 8080 наружу на всех нодах кластера
-    networks:
-      - crm_net
-    deploy:
-      replicas: 4 # Запускаем 4 копии приложения (поровну на менеджер и воркер)
-      resources:
-        limits:
-          cpus: '0.5' # Ограничение: пол-ядра на один контейнер
-          memory: 512M
-      update_config:
-        parallelism: 1
-        delay: 10s
-        order: start-first
-      restart_policy:
-        condition: on-failure
-
-networks:
-  crm_net:
-    driver: overlay # Overlay-сеть объединяет контейнеры на разных VM в единую сеть
-
-# Сохранение файла
-
-1. Нажмите комбинацию клавиш Ctrl + O (для записи файла).
-2. Нажмите Enter (для подтверждения имени файла).
-3. Нажмите Ctrl + X (для выхода из редактора nano).
-
-# Запуск приложения в кластере Swarm
-sudo docker stack deploy -c docker-compose.prod.yml my-mvc-app
-
 # Проверка
 sudo docker stack ps my-mvc-app
+docker service ps mvc
 
 # Перебалансировка
-sudo docker service update --force my-mvc-app_crm_web
+sudo docker service update --force --image cluster:latest mvc
+
+# Смена мастера
+sudo patronictl -c /etc/patroni/config.yml switchover \
+  --master vm-db \
+  --candidate vm-app \
+  --force
+
+# Роли серверов
+sudo patronictl -c /etc/patroni/config.yml list
+
+# Нчало задержки
+docker service logs -f --since 0s --timestamps my-mvc-app_crm_web 2>&1 | grep --line-buffered -F "TEST: transaction is ready but not committed"
+
+Для подключения к PostgreSQL на твоём тестовом стенде:
+- Имя пользователя: postgres
+- Пароль: PostgresPassword123!
+- База данных: postgres
+- Порт HAProxy: 5432
+- Адрес HAProxy: 192.168.10.103
+
+"DefaultConnection": "Host=192.168.10.10;Port=5000;Database=crm_db;Username=crm_app;Password=1"
+
+# Redis
+ubuntu@vm-db:~$ openssl rand -hex 32
+308f4c97aa13722713b92b30d91f62c251eb454af601e807a10efad631417f88
+
+# Kafka
+NfCBcjb4R7GUvB_5Hp7EvQ
 
 
+
+
+
+
+
+
+
+собираю стенд для тнстирования отказоустойчивости всех узлов, особенно PostgreSQL через EF Core 9.0 в Контейнере .NET Core mvc с политикой повторов.
+
+Компонент		vm-gw (Шлюз + Кворум)		vm-db (Резерв шлюза + БД + Swarm + App)		vm-app (Лидер Swarm + БД + App)
+IP-адрес		192.168.10.11          		192.168.10.12	                		192.168.10.13
+Виртуальный IP (VIP)	MASTER (VM1 192.168.10.10)	BACKUP (VM1 и VM_PG)				MASTER (VM_PG 192.168.10.5)
+Keepalived		Есть				Есть						Есть
+NGINX (L7 Web)		-				-						—
+Docker Swarm		-				Manager (Узел 2)				Manager (Leader, Узел 3)
+Контейнер .NET Core mvc	—				Запущен репликой Swarm				Запущен репликой Swarm
+Контейнер Redis		-				Запущен репликой Swarm				Запущен репликой Swarm
+HAProxy (Баланск БД)	—				Есть (Порт 5000)				Есть (Порт 5000)
+etcd (Кворум Patroni)	Узел 1 (Важен для кворума)	Узел 2						Узел 3
+Patroni + PostgreSQL	—				Нода 1 (Master)					Нода 2
+
+
+на всех 3 VM установлен ubuntu 24.05 и выполнено sudo apt update && sudo apt upgrade -y
