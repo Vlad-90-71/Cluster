@@ -63,14 +63,14 @@ namespace Cluster.Migrations
                     b.Property<bool>("IsPublished")
                         .HasColumnType("boolean");
 
-                    b.Property<string>("MessagePayloadJson")
-                        .HasColumnType("text");
-
                     b.Property<string>("MessageType")
                         .HasColumnType("text");
 
                     b.Property<string>("ResultJson")
                         .HasColumnType("jsonb");
+
+                    b.Property<string>("ResultTypeName")
+                        .HasColumnType("text");
 
                     b.HasKey("Id");
 

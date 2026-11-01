@@ -2,6 +2,8 @@ using Cluster.Data;
 using Cluster.Messaging.Handlers;
 using Cluster.Messaging.Kafka;
 using Confluent.Kafka;
+using Medallion.Threading;
+using Medallion.Threading.Redis;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
@@ -76,6 +78,17 @@ builder.Services.AddStackExchangeRedisCache(options =>
     options.InstanceName = "Cluster:";
 });
 
+builder.Services.AddSingleton<IDistributedLockProvider>(sp =>
+{
+    // Берем уже созданный и подключенный к Sentinel экземпляр redis из DI
+    var connectionMultiplexer = sp.GetRequiredService<IConnectionMultiplexer>();
+
+    // Используем базу данных по умолчанию (обычно 0)
+    var database = connectionMultiplexer.GetDatabase();
+
+    return new RedisDistributedSynchronizationProvider(database);
+});
+
 // Общие ключи Data Protection для обеих реплик приложения.
 builder.Services.AddDataProtection()
     .SetApplicationName("Cluster.Mvc")
@@ -139,6 +152,11 @@ app.MapControllerRoute(
     name: "default",
     pattern: "{controller=Home}/{action=Index}/{id?}")
     .WithStaticAssets();
+
+// ИНИЦИАЛИЗАЦИЯ СТАТИЧЕСКОГО КЛАССА
+// Извлекаем провайдер из DI контейнера и передаем его в наш executor
+var lockProvider = app.Services.GetRequiredService<IDistributedLockProvider>();
+DbTransactionExecutor.Initialize(lockProvider);
 
 await EnsureKafkaTopicExistsAsync(app.Services);
 

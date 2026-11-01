@@ -1,6 +1,8 @@
-﻿using Microsoft.EntityFrameworkCore;
+﻿using Medallion.Threading;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Npgsql;
+using System.Text.Json;
 
 namespace Cluster.Data;
 
@@ -13,207 +15,139 @@ public enum TransactionFailureReason
     DatabaseConstraintError,   // Ошибка ограничений БД (уникальность и т.д.)
     UnknownError               // Неожиданная ошибка
 }
-public sealed record TransactionExecutionResult(
+
+public sealed record TransactionExecutionResult<TResult>(
     bool IsSuccess,
     TransactionFailureReason FailureReason = TransactionFailureReason.None,
-    string? ResultJson = null,
+    TResult? Result = default,
     string? ErrorMessage = null,
     Guid? ConflictingExecutionId = null // Для отладки: кто уже использует этот ключ
 );
+
+//public sealed record OperationOutcome<TResult>(TResult Result, string? MessageType = null);
+
 public static class DbTransactionExecutor
 {
-    private const string IdempotencyIndexName = "IX_TransactionOperations_IdempotencyKey";
+    private static IDistributedLockProvider? _lockProvider;
 
-    public static async Task<TransactionExecutionResult> ExecuteAsync(
+    public static void Initialize(IDistributedLockProvider lockProvider)
+    {
+        _lockProvider = lockProvider ?? throw new ArgumentNullException(nameof(lockProvider));
+    }
+
+    public static async Task<TransactionExecutionResult<TResult>> ExecuteAsync<TResult>(
         DbContext context,
         Guid idempotencyKey,
-        Func<DbContext, CancellationToken, Task<string>> operation,
+        Func<DbContext, CancellationToken, Task<(TResult Result, string? MessageType)>> operation, 
         ILogger logger,
-        CancellationToken cancellationToken = default)
+        JsonSerializerOptions? jsonOptions = null,
+        CancellationToken cancellationToken = default) where TResult : class
     {
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(operation);
         ArgumentNullException.ThrowIfNull(logger);
 
-        if (idempotencyKey == Guid.Empty)
-            return new TransactionExecutionResult(false,
-                TransactionFailureReason.UnknownError,
-                ErrorMessage: "Idempotency key cannot be empty.");
+        if (_lockProvider == null)
+            throw new InvalidOperationException("DbTransactionExecutor не был инициализирован.");
 
-        // Фиксируем ExecutionId для текущего бизнес-вызова. 
-        // При повторных попытках внутри strategy.ExecuteAsync он обязан оставаться неизменным.
+        if (idempotencyKey == Guid.Empty)
+            return new TransactionExecutionResult<TResult>(false, ErrorMessage: "Idempotency key cannot be empty.");
+
         var executionId = Guid.NewGuid();
+        var lockKey = $"lock:idempotency:{idempotencyKey:D}";
+        var distributedLock = _lockProvider.CreateLock(lockKey);
+
+        await using var lockHandle = await distributedLock.TryAcquireAsync(TimeSpan.Zero, cancellationToken);
+
+        if (lockHandle == null)
+        {
+            logger.LogWarning("Parallel request detected. Redis lock is busy. Key: {Key}", idempotencyKey);
+            return new TransactionExecutionResult<TResult>(false,
+                FailureReason: TransactionFailureReason.IdempotencyConflict,
+                ErrorMessage: "Операция с таким ключом уже выполняется.");
+        }
+
         var strategy = context.Database.CreateExecutionStrategy();
+        var options = jsonOptions ?? new JsonSerializerOptions(JsonSerializerDefaults.Web);
 
         try
         {
             return await strategy.ExecuteAsync(async ct =>
             {
-                // Очищаем локальный кэш контекста перед каждым витком повторной попытки, 
-                // чтобы избежать склеивания старых состояний сущностей.
                 context.ChangeTracker.Clear();
-
                 await using var transaction = await context.Database.BeginTransactionAsync(ct);
 
-                // 1. Пытаемся взять неблокирующую рекомендательную транзакционную блокировку.
-                // Возвращает true, если залочено успешно, или false, если ключ занят другим процессом ПРЯМО СЕЙЧАС.
-                // Обратите внимание на добавленное: AS "Value" в конце SQL-запроса!
-                var isLocked = await context.Database
-                    .SqlQuery<bool>($"SELECT pg_try_advisory_xact_lock(hashtextextended({idempotencyKey.ToString("D")}, 0)) AS \"Value\"")
-                    .SingleAsync(ct);
-
-                if (!isLocked)
-                {
-                    logger.LogWarning(
-                        "Parallel request detected. Advisory lock is busy. Key: {Key}",
-                        idempotencyKey);
-
-                    return new TransactionExecutionResult(false,
-                        TransactionFailureReason.IdempotencyConflict,
-                        ErrorMessage: "Операция с таким ключом уже выполняется в другом потоке. Попробуйте позже.");
-                }
-
-                // 2. Блокировка успешна, проверяем статус в таблице истории
                 var existing = await context.Set<TransactionOperation>()
                     .AsNoTracking()
                     .SingleOrDefaultAsync(x => x.IdempotencyKey == idempotencyKey, ct);
 
                 if (existing is not null)
                 {
-                    // Если результат уже записан, просто отдаем его (идеальный сценарий повтора от клиента)
-
-                    if (!string.IsNullOrWhiteSpace(existing.ResultJson) &&
-                        existing.ResultJson != "{}" && existing.ResultJson != "[]")
+                    if (!string.IsNullOrWhiteSpace(existing.ResultJson))
                     {
-                        logger.LogInformation(
-                            "Idempotent result returned from cache. Key: {Key}", 
-                            idempotencyKey);
-                        
-                        return new TransactionExecutionResult(true, ResultJson: existing.ResultJson);
+                        var cachedResult = JsonSerializer.Deserialize<TResult>(existing.ResultJson, options);
+                        logger.LogInformation("Idempotent result returned from cache. Key: {Key}, Type: {Type}",
+                            idempotencyKey, existing.ResultTypeName);
+
+                        return new TransactionExecutionResult<TResult>(true, Result: cachedResult);
                     }
 
-                    // Запись есть, но JSON пустой. Проверяем, КТО ее оставил.
-                    // Если это наш же executionId — значит, это повторный виток ExecutionStrategy после сетевого сбоя. Мы можем продолжить.
-                    if (existing.ExecutionId != executionId)
-                    {
-                        logger.LogWarning(
-                            "Idempotency conflict detected. Key: {Key}, Existing ExecutionId: {ExistingId}, Current ExecutionId: {CurrentId}",
-                            idempotencyKey, existing.ExecutionId, executionId);
-
-                        return new TransactionExecutionResult(false,
-                            TransactionFailureReason.IdempotencyConflict,
-                            ErrorMessage: "Операция с таким ключом была начата другим процессом и прервана.",
-                            ConflictingExecutionId: existing.ExecutionId);
-                    }
-
-                    logger.LogInformation(
-                        "Execution strategy retry detected for the same execution. Key: {Key}, ExecutionId: {ExecutionId}", 
-                        idempotencyKey, executionId);
+                    logger.LogWarning("Idempotency conflict detected (invalid state). Key: {Key}", idempotencyKey);
+                    return new TransactionExecutionResult<TResult>(false,
+                        FailureReason: TransactionFailureReason.IdempotencyConflict,
+                        ErrorMessage: "Операция находится в некорректном состоянии.",
+                        ConflictingExecutionId: existing.ExecutionId);
                 }
-                else
+
+                // 1. Выполняем бизнес-логику и распаковываем кортеж
+                var (resultData, messageType) = await operation(context, ct);
+
+                // 2. Создаем запись Outbox ОДНИМ МАХОМ со всеми данными
+                var operationRecord = new TransactionOperation
                 {
-                    // Если записи нет вообще, создаем «черновик», фиксируя факт начала выполнения операции данным потоком.
-                    // Это спасет, если в процессе работы operation() база данных "отвалится" и блокировка снимется.
-                    var draft = new TransactionOperation
-                    {
-                        IdempotencyKey = idempotencyKey,
-                        ExecutionId = executionId,
-                        ResultJson = null,
-                        CreatedAtUtc = DateTime.UtcNow,
-                        MessageType = null,
-                        MessagePayloadJson = null,
-                        IsPublished = false
-                    };
-                    context.Set<TransactionOperation>().Add(draft);
-                    await context.SaveChangesAsync(ct);
-                }
+                    IdempotencyKey = idempotencyKey,
+                    ExecutionId = executionId,
+                    ResultJson = JsonSerializer.Serialize(resultData, options),
+                    ResultTypeName = typeof(TResult).AssemblyQualifiedName,
+                    CreatedAtUtc = DateTime.UtcNow,
+                    MessageType = messageType, // 🚀 Берем из кортежа
+                    IsPublished = false
+                };
 
-                // 3. Выполнение бизнес-логики
-                var json = await operation(context, ct);
+                context.Set<TransactionOperation>().Add(operationRecord);
 
-                if (string.IsNullOrWhiteSpace(json))
-                {
-                    return new TransactionExecutionResult(false,
-                        TransactionFailureReason.UnknownError,
-                        ErrorMessage: "Операция вернула пустой результат.");
-                }
-
-                // 4. Обновляем существующий черновик или финально записываем результат
-                var recordToUpdate = context.ChangeTracker.Entries<TransactionOperation>()
-                    .Select(e => e.Entity)
-                    .FirstOrDefault(x => x.IdempotencyKey == idempotencyKey)
-                        ?? await context.Set<TransactionOperation>()
-                            .SingleAsync(x => x.IdempotencyKey == idempotencyKey, ct);
-
-                recordToUpdate.ResultJson = json;
-                recordToUpdate.CreatedAtUtc = DateTime.UtcNow; // обновляем время завершения
-
-                context.Set<TransactionOperation>().Update(recordToUpdate);
+                // 3. ЕДИНСТВЕННЫЙ SaveChanges: сохраняет и бизнес-сущности, и Outbox
                 await context.SaveChangesAsync(ct);
 
-                // Фиксация транзакции — снимет advisory lock автоматически
                 await transaction.CommitAsync(ct);
 
-                return new TransactionExecutionResult(true, ResultJson: json);
+                return new TransactionExecutionResult<TResult>(true, Result: resultData);
             }, cancellationToken);
         }
         catch (OperationCanceledException)
         {
-            logger.LogWarning("Transaction execution was canceled by timeout or token. Key: {Key}", idempotencyKey);
+            logger.LogWarning("Transaction execution was canceled. Key: {Key}", idempotencyKey);
             throw;
         }
         catch (DbUpdateException ex) when (IsIdempotencyUniqueViolation(ex))
         {
-            logger.LogWarning(
-                "Database unique constraint violation on idempotency key. Key: {Key}", 
-                idempotencyKey);
-
-            return new TransactionExecutionResult(false, 
-                TransactionFailureReason.DatabaseConstraintError, 
-                ErrorMessage: "Нарушение уникальности ключа идемпотентности.");
-        }
-        catch (NpgsqlException npgsqlEx) when (npgsqlEx.SqlState == "25006") // Read-only transaction
-        {
-            logger.LogWarning(
-                "Database is temporarily read-only (possible Patroni failover). Key: {Key}", 
-                idempotencyKey);
-
-            return new TransactionExecutionResult(false, 
-                TransactionFailureReason.DatabaseTransientError, 
-                ErrorMessage: "База данных временно недоступна для записи. Повторите попытку.");
+            logger.LogWarning("Database unique constraint violation on idempotency key. Key: {Key}", idempotencyKey);
+            return new TransactionExecutionResult<TResult>(false,
+                FailureReason: TransactionFailureReason.DatabaseConstraintError,
+                ErrorMessage: "Ошибка уникальности ключа в базе данных.");
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, 
-                "Unexpected error during transaction execution. Key: {Key}, ExecutionId: {ExecutionId}",
-                idempotencyKey, executionId);
-
-            return new TransactionExecutionResult(false, 
-                TransactionFailureReason.UnknownError, 
-                ErrorMessage: "Произошла непредвиденная ошибка при выполнении операции.");
+            logger.LogError(ex, "Unexpected error during idempotent transaction execution. Key: {Key}", idempotencyKey);
+            return new TransactionExecutionResult<TResult>(false,
+                FailureReason: TransactionFailureReason.UnknownError,
+                ErrorMessage: ex.Message);
         }
     }
 
-    private static bool IsIdempotencyUniqueViolation(DbUpdateException exception) =>
-        exception.InnerException is PostgresException pg
-        && pg.SqlState == PostgresErrorCodes.UniqueViolation
-        && pg.ConstraintName == IdempotencyIndexName;
-
-    private static async Task AcquireTransactionLockAsync(DbContext context, Guid idempotencyKey, CancellationToken cancellationToken)
+    private static bool IsIdempotencyUniqueViolation(DbUpdateException ex)
     {
-        var connection = context.Database.GetDbConnection();
-        var transaction = context.Database.CurrentTransaction
-            ?? throw new InvalidOperationException("A transaction must be active before acquiring the advisory lock.");
-
-        await using var command = connection.CreateCommand();
-        command.Transaction = transaction.GetDbTransaction();
-        command.CommandText = "SELECT pg_advisory_xact_lock(hashtextextended(@key, 0));";
-
-        var parameter = command.CreateParameter();
-        parameter.ParameterName = "key";
-        parameter.Value = idempotencyKey.ToString("D");
-        command.Parameters.Add(parameter);
-
-        await command.ExecuteScalarAsync(cancellationToken);
+        return ex.Entries != null && ex.Entries.Any(entry =>
+            entry.Entity is TransactionOperation && entry.State == EntityState.Added);
     }
 }

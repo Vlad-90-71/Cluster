@@ -68,9 +68,9 @@ public sealed class CustomersController(
         // Успех: перенаправляем на список клиентов
         _logger.LogInformation(
             "Клиент успешно создан. ID: {CustomerId}, Name: {Name}",
-            result.CustomerId, result.Name);
+            result.Customer?.Id, result.Customer?.Name);
 
-        TempData["SuccessMessage"] = $"Клиент {result.Name} успешно создан!";
+        TempData["SuccessMessage"] = $"Клиент {result.Customer?.Name} успешно создан!";
         return RedirectToAction(nameof(Index));
     }
 }

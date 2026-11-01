@@ -1,13 +1,10 @@
 ﻿using Cluster.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
+using System.Text.Json;
 
 namespace Cluster.Messaging.Kafka;
 
-/// <summary>
-/// Фоновый сервис, который забирает неподтвержденные события из таблицы TransactionOperation (Outbox)
-/// и гарантирует их доставку в Kafka.
-/// </summary>
 public sealed class DomainEventsPublisherWorker(
     IServiceProvider serviceProvider,
     KafkaProducer kafkaProducer,
@@ -16,71 +13,86 @@ public sealed class DomainEventsPublisherWorker(
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        logger.LogInformation("🚀 KafkaOutboxPublisherWorker запущен. Ожидание событий для отправки...");
+        logger.LogInformation("🚀 DomainEventsPublisherWorker запущен. Ожидание событий...");
 
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                // Создаем скоуп, чтобы получить свежий DbContext (EF Core контексты не потокобезопасны и не должны жить вечно)
                 using var scope = serviceProvider.CreateScope();
                 var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
-                // Ищем пакет неподтвержденных сообщений. 
-                // MessageType != null гарантирует, что мы берем только те записи, где требуется отправка в Kafka.
+                // Ищем неподтвержденные сообщения. 
                 var unpublishedMessages = await dbContext.TransactionOperations
-                    .Where(x => x.MessageType != null && x.MessagePayloadJson != null && !x.IsPublished)
-                    .OrderBy(x => x.CreatedAtUtc) // Отправляем строго в порядке создания (FIFO)
-                    .Take(50)                     // Обрабатываем пакетами по 50 штук, чтобы не перегружать память
+                    .AsNoTracking()
+                    .Where(x => x.MessageType != null && x.ResultJson != null && !x.IsPublished)
+                    .OrderBy(x => x.CreatedAtUtc)
+                    .Take(50)
+                    .Select(x => new
+                    {
+                        x.Id,
+                        x.IdempotencyKey,
+                        MessageType = x.MessageType!,
+                        ResultJson = x.ResultJson!,
+                        x.CreatedAtUtc
+                    })
                     .ToListAsync(stoppingToken);
 
                 if (unpublishedMessages.Count == 0)
                 {
-                    // Если очередь пуста, делаем паузу, чтобы не нагружать БД постоянными запросами
                     await Task.Delay(TimeSpan.FromSeconds(3), stoppingToken);
                     continue;
                 }
 
                 logger.LogInformation("Найдено {Count} неподтвержденных событий. Начинаем отправку...", unpublishedMessages.Count);
 
+                var successfullyPublishedIds = new List<long>();
+
                 foreach (var message in unpublishedMessages)
                 {
                     try
                     {
-                        // Отправляем готовый JSON напрямую в Kafka
+                        // 🚀 СОБИРАЕМ КОНВЕРТ "НА ЛЕТУ" из полей БД
+                        var envelope = new DomainEventEnvelope
+                        {
+                            EventType = message.MessageType!,
+                            MessageId = message.IdempotencyKey,
+                            PayloadJson = message.ResultJson!, 
+                            OccurredAtUtc = message.CreatedAtUtc
+                        };
+
                         await kafkaProducer.PublishAsync(
-                            topic: kafkaOptions.Value.Topic, // Единый топик "DomainEvents"
-                            key: message.IdempotencyKey.ToString(), // Key гарантирует порядок и идемпотентность
-                            message: message.MessagePayloadJson!, // Value (сериализованный DomainEventEnvelope)
+                            topic: kafkaOptions.Value.Topic,
+                            key: message.IdempotencyKey.ToString(),
+                            message: JsonSerializer.Serialize(envelope),
                             cancellationToken: stoppingToken);
 
-                        // Если отправка успешна, помечаем запись как опубликованную
-                        message.IsPublished = true;
+                        successfullyPublishedIds.Add(message.Id);
                     }
                     catch (Exception ex)
                     {
-                        // Если Kafka недоступна или произошла ошибка сети, мы НЕ помечаем сообщение как IsPublished.
-                        // В следующем цикле (через 3 секунды) воркер снова попытается его отправить.
-                        logger.LogError(ex,
-                            "Ошибка публикации сообщения {IdempotencyKey} (Тип: {MessageType}). Будет повторная попытка.",
+                        logger.LogError(ex, "Ошибка публикации сообщения {IdempotencyKey} (Тип: {MessageType}). Будет повторная попытка.",
                             message.IdempotencyKey, message.MessageType);
                     }
                 }
 
-                // Сохраняем изменения (IsPublished = true) для всего пакета за один запрос к БД
-                await dbContext.SaveChangesAsync(stoppingToken);
+                // 2. БЫСТРОЕ ОБНОВЛЕНИЕ БЕЗ ТРЕКИНГА
+                if (successfullyPublishedIds.Count > 0)
+                {
+                    await dbContext.TransactionOperations
+                        .Where(x => successfullyPublishedIds.Contains(x.Id))
+                        .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.IsPublished, true), stoppingToken);
 
-                logger.LogInformation("Пакет событий успешно обработан и сохранен в БД.");
+                    logger.LogInformation("Успешно обновлен статус для {Count} событий.", successfullyPublishedIds.Count);
+                }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                // Корректное завершение работы приложения
                 break;
             }
             catch (Exception ex)
             {
-                // Глобальная ошибка (например, отвалилась БД). Ждем и пробуем снова.
-                logger.LogError(ex, "Критическая ошибка в цикле KafkaOutboxPublisherWorker. Повтор через 5 секунд...");
+                logger.LogError(ex, "Критическая ошибка в цикле DomainEventsPublisherWorker. Повтор через 5 секунд...");
                 await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
             }
         }
