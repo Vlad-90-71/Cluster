@@ -6,25 +6,32 @@ namespace Cluster.Messaging.Kafka;
 public interface IDomainEventHandler
 {
     string SupportedEventType { get; }
-    Task HandleAsync(string payloadJson, CancellationToken ct);
+    Task HandleAsync(object payload, CancellationToken ct);
 }
 
 // 2. Реестр, который хранит словарь "Тип события -> Обработчик"
 public sealed class DomainEventHandlerRegistry
 {
-    private readonly Dictionary<string, IDomainEventHandler> _handlers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ILogger<DomainEventHandlerRegistry> _logger;
 
-    // Конструктор автоматически собирает все обработчики из DI-контейнера
-    public DomainEventHandlerRegistry(IEnumerable<IDomainEventHandler> handlers)
+    private readonly Dictionary<string, IDomainEventHandler> _handlers = new(StringComparer.OrdinalIgnoreCase);
+   
+    public DomainEventHandlerRegistry(
+        IEnumerable<IDomainEventHandler> handlers, 
+        ILogger<DomainEventHandlerRegistry> logger)
     {
+        _logger = logger;
+
         foreach (var handler in handlers)
         {
             _handlers[handler.SupportedEventType] = handler;
         }
+
+        // 🚀 ЭТА СТРОКА СКАЖЕТ НАМ ВСЮ ПРАВДУ ПРИ ЗАПУСКЕ:
+        _logger.LogInformation("🔍 ЗАГРУЖЕНО ОБРАБОТЧИКОВ: {Count}. Найденные типы: {Types}",
+            _handlers.Count, string.Join(", ", _handlers.Keys));
     }
 
-    public bool TryGetHandler(string eventType, out IDomainEventHandler? handler)
-    {
-        return _handlers.TryGetValue(eventType, out handler);
-    }
+    public bool TryGetHandler(string eventType, out IDomainEventHandler? handler) =>
+        _handlers.TryGetValue(eventType, out handler);
 }

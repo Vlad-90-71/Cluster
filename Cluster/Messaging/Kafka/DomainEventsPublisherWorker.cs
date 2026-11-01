@@ -1,4 +1,5 @@
 ﻿using Cluster.Data;
+using Microsoft.AspNetCore.Components.Server.ProtectedBrowserStorage;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using System.Text.Json;
@@ -13,6 +14,8 @@ public sealed class DomainEventsPublisherWorker(
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        const int BatchSize = 50;
+
         logger.LogInformation("🚀 DomainEventsPublisherWorker запущен. Ожидание событий...");
 
         while (!stoppingToken.IsCancellationRequested)
@@ -27,13 +30,14 @@ public sealed class DomainEventsPublisherWorker(
                     .AsNoTracking()
                     .Where(x => x.MessageType != null && x.ResultJson != null && !x.IsPublished)
                     .OrderBy(x => x.CreatedAtUtc)
-                    .Take(50)
+                    .Take(BatchSize)
                     .Select(x => new
                     {
                         x.Id,
                         x.IdempotencyKey,
                         MessageType = x.MessageType!,
                         ResultJson = x.ResultJson!,
+                        PayloadTypeName = x.ResultTypeName!,
                         x.CreatedAtUtc
                     })
                     .ToListAsync(stoppingToken);
@@ -46,7 +50,8 @@ public sealed class DomainEventsPublisherWorker(
 
                 logger.LogInformation("Найдено {Count} неподтвержденных событий. Начинаем отправку...", unpublishedMessages.Count);
 
-                var successfullyPublishedIds = new List<long>();
+                int count = 0;
+                var successfullyPublishedIds = new long[BatchSize];
 
                 foreach (var message in unpublishedMessages)
                 {
@@ -57,7 +62,8 @@ public sealed class DomainEventsPublisherWorker(
                         {
                             EventType = message.MessageType!,
                             MessageId = message.IdempotencyKey,
-                            PayloadJson = message.ResultJson!, 
+                            PayloadJson = message.ResultJson, 
+                            PayloadTypeName = message.PayloadTypeName,
                             OccurredAtUtc = message.CreatedAtUtc
                         };
 
@@ -67,7 +73,7 @@ public sealed class DomainEventsPublisherWorker(
                             message: JsonSerializer.Serialize(envelope),
                             cancellationToken: stoppingToken);
 
-                        successfullyPublishedIds.Add(message.Id);
+                        successfullyPublishedIds[count++] = message.Id;
                     }
                     catch (Exception ex)
                     {
@@ -77,13 +83,17 @@ public sealed class DomainEventsPublisherWorker(
                 }
 
                 // 2. БЫСТРОЕ ОБНОВЛЕНИЕ БЕЗ ТРЕКИНГА
-                if (successfullyPublishedIds.Count > 0)
+                if (count > 0)
                 {
+                    var idsForQuery = count == BatchSize 
+                        ? successfullyPublishedIds 
+                        : successfullyPublishedIds.AsSpan(0, count).ToArray();
+
                     await dbContext.TransactionOperations
-                        .Where(x => successfullyPublishedIds.Contains(x.Id))
+                        .Where(x => idsForQuery.Contains(x.Id))
                         .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.IsPublished, true), stoppingToken);
 
-                    logger.LogInformation("Успешно обновлен статус для {Count} событий.", successfullyPublishedIds.Count);
+                    logger.LogInformation("Успешно обновлен статус для {Count} событий.", count);
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)

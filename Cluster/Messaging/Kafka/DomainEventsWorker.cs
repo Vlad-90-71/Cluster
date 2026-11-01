@@ -12,6 +12,7 @@ public sealed class DomainEventsWorker(
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var options = kafkaOptions.Value;
+        var jsonOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 
         var consumerConfig = new ConsumerConfig
         {
@@ -32,6 +33,9 @@ public sealed class DomainEventsWorker(
             try
             {
                 var consumeResult = consumer.Consume(stoppingToken);
+                logger.LogInformation(
+                    "📥 Получено сообщение из Kafka. Ключ: {Key}", 
+                    consumeResult.Message.Key); 
 
                 var envelope = JsonSerializer.Deserialize<DomainEventEnvelope>(consumeResult.Message.Value);
 
@@ -47,8 +51,36 @@ public sealed class DomainEventsWorker(
                 {
                     try
                     {
-                        // Выполняем бизнес-логику конкретного события
-                        await handler.HandleAsync(envelope.PayloadJson, stoppingToken);
+                        // 🚀 1. ПОЛУЧАЕМ ТИП ИЗ AssemblyQualifiedName
+                        var payloadType = Type.GetType(envelope.PayloadTypeName);
+
+                        if (payloadType == null)
+                        {
+                            logger.LogError(
+                                "Критическая ошибка: не удалось найти тип '{TypeName}' для события '{EventType}'. Проверьте сборку.",
+                                envelope.PayloadTypeName, envelope.EventType);
+
+                            // Коммитим, чтобы не зациклить сообщение, которое никогда не обработается из-за отсутствующего типа
+                            consumer.Commit(consumeResult);
+                            continue;
+                        }
+
+                        // 🚀 2. ДЕСЕРИАЛИЗУЕМ JSON В КОНКРЕТНЫЙ ТИП
+                        var payloadObj = JsonSerializer.Deserialize(envelope.PayloadJson, payloadType, jsonOptions);
+                        
+                        if (payloadObj == null)
+                        {
+                            logger.LogError(
+                                "Критическая ошибка: не удалось десериализовать PayloadJson в тип '{TypeName}'. JSON: {Json}",
+                                payloadType.FullName, envelope.PayloadJson);
+
+                            // Коммитим, чтобы не зацикливать сообщение с некорректными данными
+                            consumer.Commit(consumeResult);
+                            continue;
+                        }
+
+                        // 🚀 3. ПЕРЕДАЕМ ОБЪЕКТ В ХЕНДЛЕР
+                        await handler.HandleAsync(payloadObj, stoppingToken);
 
                         // Коммитим ТОЛЬКО после успешной обработки
                         consumer.Commit(consumeResult);

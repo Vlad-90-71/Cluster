@@ -1,25 +1,32 @@
-﻿using Cluster.Messaging.Kafka;
-using System.Text.Json;
+﻿using Cluster.Application.Customers.Commands;
+using Cluster.Messaging.Kafka;
 
 namespace Cluster.Messaging.Handlers;
 
-// DTO для полезной нагрузки этого конкретного события
-public sealed record CustomerCreatedPayload(long CustomerId, string Name, string Email);
-
-// Обработчик для создания клиента
 public sealed class CustomerCreatedHandler(ILogger<CustomerCreatedHandler> logger) : IDomainEventHandler
 {
     public string SupportedEventType => "CustomerCreated";
 
-    public Task HandleAsync(string payloadJson, CancellationToken ct)
+    public Task HandleAsync(object payload, CancellationToken ct)
     {
-        // Десериализуем только полезную нагрузку
-        var data = JsonSerializer.Deserialize<CustomerCreatedPayload>(payloadJson);
+        // 🚀 БЕЗОПАСНОЕ ПРИВЕДЕНИЕ ТИПА
+        if (payload is CustomerCreatedData data)
+        {
+            logger.LogInformation(
+                "🎉 [СОБЫТИЕ] Клиент успешно создан! ID: {Id}, Имя: {Name}, Email: {Email}",
+                data.Id, data.Name, data.Email);
 
-        logger.LogInformation("[CustomerCreated] Успешно создан клиент: {Name} (ID: {Id})", data?.Name, data?.CustomerId);
+            // Здесь можно вызывать email-сервисы, отправлять вебхуки и т.д.
+            // Все данные уже строго типизированы, никаких GetProperty("id")!
+        }
+        else
+        {
+            // Защита от дурака: если по какой-то причине пришел не тот тип
+            logger.LogWarning(
+                "⚠️ Неожиданный тип полезной нагрузки для CustomerCreated. Ожидался CustomerCreatedData, получен: {Type}",
+                payload?.GetType().FullName);
+        }
 
-        // Здесь может быть отправка Email, SMS и т.д.
         return Task.CompletedTask;
     }
 }
-

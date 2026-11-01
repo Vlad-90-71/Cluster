@@ -13,6 +13,8 @@ public sealed record DomainEventEnvelope
     [JsonPropertyName("payload")]
     public string PayloadJson { get; set; } = string.Empty; // JSON с данными события
 
+    public string PayloadTypeName { get; set; } = string.Empty;
+
     [JsonPropertyName("occurredAtUtc")]
     public DateTime OccurredAtUtc { get; set; } = DateTime.UtcNow;
 }

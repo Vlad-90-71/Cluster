@@ -1,9 +1,8 @@
-﻿using Cluster.Application.Customers.Queries.GetCustomers;
-using Cluster.Data;
-using Cluster.Messaging.Kafka;
-using MediatR;
+﻿using System.Text.Json;
 using Microsoft.Extensions.Caching.Distributed;
-using System.Text.Json;
+using MediatR;
+using Cluster.Data;
+using Cluster.Application.Customers.Queries.GetCustomers;
 
 namespace Cluster.Application.Customers.Commands;
 
