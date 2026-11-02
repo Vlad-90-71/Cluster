@@ -26,6 +26,9 @@ sudo patronictl -c /etc/patroni/config.yml switchover \
 # Роли серверов
 sudo patronictl -c /etc/patroni/config.yml list
 
+# Log всех реплик
+docker service logs --follow --tail 100 --timestamps mvc
+
 # Нчало задержки
 docker service logs -f --since 0s --timestamps my-mvc-app_crm_web 2>&1 | grep --line-buffered -F "TEST: transaction is ready but not committed"
 
