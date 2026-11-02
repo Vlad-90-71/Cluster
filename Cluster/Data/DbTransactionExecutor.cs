@@ -22,8 +22,6 @@ public sealed record TransactionExecutionResult<TResult>(
     Guid? ConflictingExecutionId = null // Для отладки: кто уже использует этот ключ
 );
 
-//public sealed record OperationOutcome<TResult>(TResult Result, string? MessageType = null);
-
 public static class DbTransactionExecutor
 {
     private static IDistributedLockProvider? _lockProvider;
