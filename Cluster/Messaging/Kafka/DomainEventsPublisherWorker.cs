@@ -1,8 +1,7 @@
-﻿using Cluster.Data;
-using Microsoft.AspNetCore.Components.Server.ProtectedBrowserStorage;
-using Microsoft.EntityFrameworkCore;
+﻿using System.Text.Json;
 using Microsoft.Extensions.Options;
-using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
+using Cluster.Data;
 
 namespace Cluster.Messaging.Kafka;
 
@@ -12,9 +11,11 @@ public sealed class DomainEventsPublisherWorker(
     IOptions<KafkaOptions> kafkaOptions,
     ILogger<DomainEventsPublisherWorker> logger) : BackgroundService
 {
+    private const int BatchSize = 50;
+    private const int ClaimDuration = 60;
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        const int BatchSize = 50;
 
         logger.LogInformation("🚀 DomainEventsPublisherWorker запущен. Ожидание событий...");
 
@@ -26,32 +27,22 @@ public sealed class DomainEventsPublisherWorker(
                 var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
                 // Ищем неподтвержденные сообщения. 
-                var unpublishedMessages = await dbContext.TransactionOperations
-                    .AsNoTracking()
-                    .Where(x => x.MessageType != null && x.ResultJson != null && !x.IsPublished)
-                    .OrderBy(x => x.CreatedAtUtc)
-                    .Take(BatchSize)
-                    .Select(x => new
-                    {
-                        x.Id,
-                        x.IdempotencyKey,
-                        MessageType = x.MessageType!,
-                        ResultJson = x.ResultJson!,
-                        PayloadTypeName = x.ResultTypeName!,
-                        x.CreatedAtUtc
-                    })
-                    .ToListAsync(stoppingToken);
+                var unpublishedMessages = await ClaimBatchAsync(dbContext, stoppingToken);
 
-                if (unpublishedMessages.Count == 0)
+                if (unpublishedMessages.Length == 0)
                 {
                     await Task.Delay(TimeSpan.FromSeconds(3), stoppingToken);
                     continue;
                 }
 
-                logger.LogInformation("Найдено {Count} неподтвержденных событий. Начинаем отправку...", unpublishedMessages.Count);
+                var claimId = unpublishedMessages[0].ClaimId!.Value;
+
+                logger.LogInformation(
+                    "Захвачено {Count} событий для публикации. ClaimId: {ClaimId}",
+                    unpublishedMessages.Length, claimId);
 
                 int count = 0;
-                var successfullyPublishedIds = new long[BatchSize];
+                var successfullyPublishedIds = new long[unpublishedMessages.Length];
 
                 foreach (var message in unpublishedMessages)
                 {
@@ -62,8 +53,8 @@ public sealed class DomainEventsPublisherWorker(
                         {
                             EventType = message.MessageType!,
                             MessageId = message.IdempotencyKey,
-                            PayloadJson = message.ResultJson, 
-                            PayloadTypeName = message.PayloadTypeName,
+                            PayloadJson = message.ResultJson!, 
+                            PayloadTypeName = message.ResultTypeName!,
                             OccurredAtUtc = message.CreatedAtUtc
                         };
 
@@ -74,6 +65,10 @@ public sealed class DomainEventsPublisherWorker(
                             cancellationToken: stoppingToken);
 
                         successfullyPublishedIds[count++] = message.Id;
+                    }
+                    catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                    {
+                        throw;
                     }
                     catch (Exception ex)
                     {
@@ -90,8 +85,12 @@ public sealed class DomainEventsPublisherWorker(
                         : successfullyPublishedIds.AsSpan(0, count).ToArray();
 
                     await dbContext.TransactionOperations
-                        .Where(x => idsForQuery.Contains(x.Id))
-                        .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.IsPublished, true), stoppingToken);
+                        .Where(x =>  idsForQuery.Contains(x.Id) && x.ClaimId == claimId && !x.IsPublished)
+                        .ExecuteUpdateAsync(setters => setters
+                            .SetProperty(x => x.IsPublished, true)
+                            .SetProperty(x => x.ClaimId, (Guid?)null)
+                            .SetProperty(x => x.LockedUntilUtc, (DateTime?)null),
+                            stoppingToken);
 
                     logger.LogInformation("Успешно обновлен статус для {Count} событий.", count);
                 }
@@ -106,5 +105,54 @@ public sealed class DomainEventsPublisherWorker(
                 await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
             }
         }
+    }
+
+    private static async Task<TransactionOperation[]> ClaimBatchAsync(AppDbContext dbContext, CancellationToken cancellationToken)
+    {
+        var now = DateTime.UtcNow;
+        var claimId = Guid.NewGuid();
+        var lockedUntil = now.AddSeconds(ClaimDuration);
+
+        // Получаем кандидатов на захват.
+        var candidateIds = await dbContext.TransactionOperations
+            .AsNoTracking()
+            .Where(x =>
+                !x.IsPublished && x.MessageType != null && x.ResultJson != null && x.ResultTypeName != null &&
+                (x.ClaimId == null || x.LockedUntilUtc <= now))
+            .OrderBy(x => x.CreatedAtUtc)
+            .Select(x => x.Id)
+            .Take(BatchSize)
+            .ToListAsync(cancellationToken);
+
+        int count = 0;
+        var claimedIds = new long[BatchSize];
+
+
+        foreach (var id in candidateIds)
+        {
+            // Условное атомарное обновление.
+            var affectedRows = await dbContext.TransactionOperations
+                .Where(x => x.Id == id && !x.IsPublished && (x.ClaimId == null || x.LockedUntilUtc <= now))
+                .ExecuteUpdateAsync(setters => setters
+                    .SetProperty(x => x.ClaimId, claimId)
+                    .SetProperty(x => x.LockedUntilUtc, lockedUntil)
+                    .SetProperty(x => x.AttemptCount, x => x.AttemptCount + 1),
+                    cancellationToken);
+
+            if (affectedRows == 1)
+                claimedIds[count++] = id;
+        }
+
+        if (count == 0)
+            return [];
+
+        var idsForQuery = count == BatchSize ? claimedIds : claimedIds.AsSpan(0, count).ToArray();
+
+        // Возвращаем только записи, захваченные текущим пакетом.
+        return await dbContext.TransactionOperations
+            .AsNoTracking()
+            .Where(x => x.ClaimId == claimId && idsForQuery.Contains(x.Id))
+            .OrderBy(x => x.CreatedAtUtc)
+            .ToArrayAsync(cancellationToken);
     }
 }

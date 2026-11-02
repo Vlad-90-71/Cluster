@@ -31,7 +31,7 @@ public sealed class CreateCustomerCommandHandler(
         ArgumentNullException.ThrowIfNull(request);
 
         // 🚀 УКАЗЫВАЕМ ТИП РЕЗУЛЬТАТА: <CustomerCreatedData>
-        var transactionResult = await DbTransactionExecutor.ExecuteAsync(
+        var transactionResult = await DbTransactionExecutor.CreateAsync(
             context: dbContext,
             idempotencyKey: request.IdempotencyKey,
             operation: async (context, ct) =>

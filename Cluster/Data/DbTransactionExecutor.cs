@@ -31,7 +31,7 @@ public static class DbTransactionExecutor
         _lockProvider = lockProvider ?? throw new ArgumentNullException(nameof(lockProvider));
     }
 
-    public static async Task<TransactionExecutionResult<TResult>> ExecuteAsync<TResult>(
+    public static async Task<TransactionExecutionResult<TResult>> CreateAsync<TResult>(
         DbContext context,
         Guid idempotencyKey,
         Func<DbContext, CancellationToken, Task<(TResult Result, string? MessageType)>> operation, 
@@ -63,8 +63,9 @@ public static class DbTransactionExecutor
                 ErrorMessage: "Операция с таким ключом уже выполняется.");
         }
 
-        var strategy = context.Database.CreateExecutionStrategy();
         var options = jsonOptions ?? new JsonSerializerOptions(JsonSerializerDefaults.Web);
+
+        var strategy = context.Database.CreateExecutionStrategy();
 
         try
         {
@@ -141,6 +142,99 @@ public static class DbTransactionExecutor
         }
     }
 
+
+    public static async Task<TransactionExecutionResult<bool>> UpdateAsync(
+        DbContext context,
+        Guid idempotencyKey,
+        Func<DbContext, CancellationToken, Task> operation,
+        ILogger logger,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        ArgumentNullException.ThrowIfNull(operation);
+        ArgumentNullException.ThrowIfNull(logger);
+
+        if (_lockProvider == null)
+            throw new InvalidOperationException("DbTransactionExecutor не был инициализирован.");
+
+        if (idempotencyKey == Guid.Empty) 
+            return new TransactionExecutionResult<bool>(false, 
+                ErrorMessage: "Idempotency key cannot be empty.");
+
+        var lockKey = $"lock:idempotency:{idempotencyKey:D}";
+        var distributedLock = _lockProvider.CreateLock(lockKey);
+
+        await using var lockHandle =
+            await distributedLock.TryAcquireAsync(TimeSpan.Zero, cancellationToken);
+
+        if (lockHandle == null)
+        {
+            logger.LogWarning("Parallel event processing detected. Key: {Key}", idempotencyKey);
+
+            return new TransactionExecutionResult<bool>(false,
+                FailureReason: TransactionFailureReason.IdempotencyConflict,
+                ErrorMessage: "Событие уже обрабатывается.");
+        }
+
+        var strategy = context.Database.CreateExecutionStrategy();
+
+        try
+        {
+            return await strategy.ExecuteAsync(async ct =>
+            {
+                context.ChangeTracker.Clear();
+
+                await using var transaction =
+                    await context.Database.BeginTransactionAsync(ct);
+
+                var existing = await context.Set<TransactionOperation>()
+                    .SingleOrDefaultAsync(x => x.IdempotencyKey == idempotencyKey, ct);
+
+                if (existing == null)
+                {
+                    return new TransactionExecutionResult<bool>(false,
+                        FailureReason: TransactionFailureReason.UnknownError,
+                        ErrorMessage: "TransactionOperation не найдена.");
+                }
+
+                if (existing.IsProcessed)
+                {
+                    logger.LogInformation("Event already processed. Key: {Key}", idempotencyKey);
+
+                    await transaction.CommitAsync(ct);
+
+                    return new TransactionExecutionResult<bool>(true, Result: false);
+                }
+
+                await operation(context, ct);
+
+                existing.IsProcessed = true;
+                existing.ProcessedAtUtc = DateTime.UtcNow;
+
+                await context.SaveChangesAsync(ct);
+                await transaction.CommitAsync(ct);
+
+                logger.LogInformation("Event successfully processed. Key: {Key}", idempotencyKey);
+
+                return new TransactionExecutionResult<bool>(true, Result: true);
+            }, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            logger.LogWarning("Event processing canceled. Key: {Key}", idempotencyKey);
+
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Error processing event. Key: {Key}", idempotencyKey);
+
+            return new TransactionExecutionResult<bool>(
+                false,
+                FailureReason: TransactionFailureReason.UnknownError,
+                ErrorMessage: ex.Message);
+        }
+    }
     private static bool IsIdempotencyUniqueViolation(DbUpdateException ex)
     {
         return ex.Entries != null && ex.Entries.Any(entry =>

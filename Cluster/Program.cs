@@ -101,9 +101,10 @@ builder.Services
     .ValidateOnStart();
 
 builder.Services.AddSingleton<KafkaProducer>();
+builder.Services.AddSingleton<DlqTestPublisher>();
 
 // 1. Регистрируем Реестр обработчиков
-builder.Services.AddSingleton<DomainEventHandlerRegistry>();
+builder.Services.AddScoped<DomainEventHandlerRegistry>();
 
 // 2. Автоматически регистрируем ВСЕ классы, реализующие IDomainEventHandler
 // (Если не используете Scrutor, можно добавить их вручную по одному)
@@ -111,12 +112,8 @@ builder.Services.Scan(scan => scan
     .FromAssemblyOf<Program>()
     .AddClasses(classes => classes.AssignableTo<IDomainEventHandler>())
     .AsImplementedInterfaces()
-    .WithSingletonLifetime());
+    .WithScopedLifetime());
 
-// 2. Регистрируем обработчики вручную
-//builder.Services.AddSingleton<CustomerCreatedHandler>();
-// В будущем добавляйте новые обработчики здесь:
-// builder.Services.AddSingleton<AnotherEventHandler>();
 
 // 3. Регистрируем ЕДИНЫЙ фоновый воркер
 builder.Services.AddHostedService<DomainEventsWorker>();

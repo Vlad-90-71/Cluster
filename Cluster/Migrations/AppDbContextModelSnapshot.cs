@@ -51,6 +51,12 @@ namespace Cluster.Migrations
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
 
+                    b.Property<int>("AttemptCount")
+                        .HasColumnType("integer");
+
+                    b.Property<Guid?>("ClaimId")
+                        .HasColumnType("uuid");
+
                     b.Property<DateTime>("CreatedAtUtc")
                         .HasColumnType("timestamp with time zone");
 
@@ -60,11 +66,20 @@ namespace Cluster.Migrations
                     b.Property<Guid>("IdempotencyKey")
                         .HasColumnType("uuid");
 
+                    b.Property<bool>("IsProcessed")
+                        .HasColumnType("boolean");
+
                     b.Property<bool>("IsPublished")
                         .HasColumnType("boolean");
 
+                    b.Property<DateTime?>("LockedUntilUtc")
+                        .HasColumnType("timestamp with time zone");
+
                     b.Property<string>("MessageType")
                         .HasColumnType("text");
+
+                    b.Property<DateTime?>("ProcessedAtUtc")
+                        .HasColumnType("timestamp with time zone");
 
                     b.Property<string>("ResultJson")
                         .HasColumnType("jsonb");

@@ -1,13 +1,21 @@
+using Cluster.Messaging.Kafka;
 using Cluster.Models;
 using Microsoft.AspNetCore.Mvc;
 using System.Diagnostics;
 
 namespace Cluster.Controllers
 {
-    public class HomeController(IWebHostEnvironment env, ILogger<HomeController> logger) : Controller
+    public class HomeController(
+        IWebHostEnvironment env, 
+        ILogger<HomeController> logger,
+        KafkaProducer kafkaProducer,
+        DlqTestPublisher dlqTestPublisher) : Controller
     {
         private readonly IWebHostEnvironment _env = env;
         private readonly ILogger<HomeController> _logger = logger;
+        
+        private readonly KafkaProducer _kafkaProducer = kafkaProducer;
+        private readonly DlqTestPublisher _dlqTestPublisher = dlqTestPublisher;
 
         public IActionResult Index()
         {
@@ -18,7 +26,35 @@ namespace Cluster.Controllers
         {
             return View();
         }
-        
+
+        [HttpPost]
+        public async Task<IActionResult> TestDlq(CancellationToken cancellationToken)
+        {
+            await _dlqTestPublisher.PublishTestMessageAsync(cancellationToken);
+
+            return Ok("Тестовое сообщение отправлено в DomainEvents.DLQ.");
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> TestDomainEvent(CancellationToken cancellationToken)
+        {
+            var message = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                messageId = Guid.NewGuid(),
+                eventType = "DLQ_TEST",
+                payloadTypeName = "TestPayload",
+                payloadJson = "{}"
+            });
+
+            await _kafkaProducer.PublishAsync(
+                "DomainEvents",
+                Guid.NewGuid().ToString(),
+                message,
+                cancellationToken);
+
+            return Ok("Тестовое сообщение отправлено в DomainEvents.");
+        }
+
         [HttpPost]
         public async Task<IActionResult> UploadFile(IFormFile file)
         {
