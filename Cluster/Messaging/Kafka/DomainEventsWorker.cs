@@ -1,19 +1,19 @@
 ﻿using Cluster.Data;
 using Confluent.Kafka;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using System.Text.Json;
 
 namespace Cluster.Messaging.Kafka;
 
+// 🚀 DomainEventDispatcher УБРАН из конструктора, чтобы избежать Captive Dependency
 public sealed class DomainEventsWorker(
     IServiceScopeFactory scopeFactory,
     IOptions<KafkaOptions> kafkaOptions,
     ILogger<DomainEventsWorker> logger) : BackgroundService
 {
-    private const int MaxAttempts = 5;
-    private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(1);
     private const string DlqTopic = "DomainEvents.DLQ";
-    private const bool SimulateProcessingFailure = true;
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var options = kafkaOptions.Value;
@@ -25,7 +25,7 @@ public sealed class DomainEventsWorker(
             GroupId = options.ConsumerGroup,
             AutoOffsetReset = AutoOffsetReset.Earliest,
             EnableAutoCommit = false,
-            EnableAutoOffsetStore = false,
+            EnableAutoOffsetStore = false, // Отключаем авто-сохранение смещений для ручного контроля
             MaxPollRecords = 100
         };
 
@@ -40,9 +40,7 @@ public sealed class DomainEventsWorker(
 
         consumer.Subscribe(options.Topic);
 
-        logger.LogInformation(
-            "DomainEventsWorker запущен. Подписка на топик: {Topic}; DLQ: {DlqTopic}",
-            options.Topic, DlqTopic);
+        logger.LogInformation("🚀 DomainEventsWorker запущен. Подписка на топик: {Topic}; DLQ: {DlqTopic}", options.Topic, DlqTopic);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -53,156 +51,93 @@ public sealed class DomainEventsWorker(
                 if (consumeResult.IsPartitionEOF)
                     continue;
 
-                logger.LogInformation(
-                    "Получено сообщение из Kafka. Topic: {Topic}, Partition: {Partition}, Offset: {Offset}, Key: {Key}",
-                    consumeResult.Topic, consumeResult.Partition.Value, consumeResult.Offset.Value, consumeResult.Message.Key);
+                logger.LogDebug("Получено сообщение. Topic: {Topic}, Partition: {Partition}, Offset: {Offset}",
+                    consumeResult.Topic, consumeResult.Partition.Value, consumeResult.Offset.Value);
 
+                // 1. Десериализация конверта
                 DomainEventEnvelope? envelope;
-
                 try
                 {
-                    envelope = JsonSerializer.Deserialize<DomainEventEnvelope>(
-                        consumeResult.Message.Value, jsonOptions);
+                    envelope = JsonSerializer.Deserialize<DomainEventEnvelope>(consumeResult.Message.Value, jsonOptions);
                 }
                 catch (JsonException ex)
                 {
-                    await SendToDlqAndCommitAsync(consumer,  dlqProducer, consumeResult, null,
-                        $"Invalid envelope JSON: {ex.Message}", stoppingToken);
-
+                    await SendToDlqAndCommitAsync(consumer, dlqProducer, consumeResult, null, $"Invalid envelope JSON: {ex.Message}", stoppingToken);
                     continue;
                 }
 
                 if (envelope is null)
                 {
-                    await SendToDlqAndCommitAsync(consumer, dlqProducer, consumeResult, null,
-                        "Envelope deserialized to null.", stoppingToken);
-
+                    await SendToDlqAndCommitAsync(consumer, dlqProducer, consumeResult, null, "Envelope deserialized to null.", stoppingToken);
                     continue;
                 }
 
+                // 2. Десериализация полезной нагрузки (Payload)
                 var payloadType = Type.GetType(envelope.PayloadTypeName);
-
                 if (payloadType is null)
                 {
-                    await SendToDlqAndCommitAsync(consumer, dlqProducer, consumeResult, envelope,
-                        $"Payload type not found: {envelope.PayloadTypeName}", stoppingToken);
-
+                    await SendToDlqAndCommitAsync(consumer, dlqProducer, consumeResult, envelope, $"Payload type not found: {envelope.PayloadTypeName}", stoppingToken);
                     continue;
                 }
 
                 object? payload;
-
                 try
                 {
                     payload = JsonSerializer.Deserialize(envelope.PayloadJson, payloadType, jsonOptions);
                 }
                 catch (JsonException ex)
                 {
-                    await SendToDlqAndCommitAsync(consumer, dlqProducer, consumeResult, envelope,
-                        $"Payload JSON deserialization failed: {ex.Message}", stoppingToken);
-
+                    await SendToDlqAndCommitAsync(consumer, dlqProducer, consumeResult, envelope, $"Payload JSON deserialization failed: {ex.Message}", stoppingToken);
                     continue;
                 }
 
                 if (payload is null)
                 {
-                    await SendToDlqAndCommitAsync(consumer, dlqProducer, consumeResult, envelope,
-                        "Payload deserialized to null.", stoppingToken);
-
+                    await SendToDlqAndCommitAsync(consumer, dlqProducer, consumeResult, envelope, "Payload deserialized to null.", stoppingToken);
                     continue;
                 }
 
-                var processed = false;
-                var attempts = 0;
-                string? lastError = null;
-
+                // 3. Обработка события
+                // 🚀 СОЗДАЕМ SCOPE ДЛЯ КАЖДОГО СООБЩЕНИЯ. 
+                // Это гарантирует, что AppDbContext, DomainEventDispatcher, Registry и сам Handler 
+                // будут созданы в одном и том же изолированном контексте и корректно удалены (Dispose) после обработки.
                 await using var scope = scopeFactory.CreateAsyncScope();
 
-                var services = scope.ServiceProvider;
+                var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
-                var eventRegistry = services.GetRequiredService<DomainEventHandlerRegistry>();
+                // 🚀 ЗАПРАШИВАЕМ ДИСПЕТЧЕР ИЗ ТОГО ЖЕ SCOPE, что и DbContext
+                var dispatcher = scope.ServiceProvider.GetRequiredService<DomainEventDispatcher>();
 
-                if (eventRegistry.TryGetHandler(envelope.EventType, out var handler) && handler is not null)
-                {
-                    var dbContext = services.GetRequiredService<AppDbContext>();
+                bool shouldCommit = await dispatcher.DispatchAsync(dbContext, envelope, payload, stoppingToken);
 
-                    while (!stoppingToken.IsCancellationRequested && attempts < MaxAttempts)
-                    {
-                        attempts++;
-
-                        try
-                        {
-                            var result = await DbTransactionExecutor.UpdateAsync(
-                                dbContext,
-                                envelope.MessageId,
-                                (_, ct) => handler.HandleAsync(payload, ct),
-                                logger,
-                                stoppingToken);
-
-                            if (result.IsSuccess)
-                            {
-                                processed = true;
-
-                                logger.LogInformation(
-                                    "Событие {MessageId} обработано. Attempt: {Attempt}/{MaxAttempts}.",
-                                    envelope.MessageId, attempts, MaxAttempts);
-
-                                break;
-                            }
-
-                            lastError = $"{result.FailureReason}: {result.ErrorMessage}";
-
-                            logger.LogWarning(
-                                "Попытка {Attempt}/{MaxAttempts} обработки события {MessageId} не удалась. {Error}",
-                                attempts, MaxAttempts, envelope.MessageId, lastError);
-                        }
-                        catch (OperationCanceledException)
-                            when (stoppingToken.IsCancellationRequested)
-                        {
-                            throw;
-                        }
-                        catch (Exception ex)
-                        {
-                            lastError = ex.Message;
-
-                            logger.LogError(ex,
-                                "Ошибка попытки {Attempt}/{MaxAttempts} обработки события {MessageId}.",
-                                attempts, MaxAttempts, envelope.MessageId);
-                        }
-
-                        if (attempts < MaxAttempts)
-                            await Task.Delay(RetryDelay, stoppingToken);
-                    }
-                }
-                else
-                    lastError = $"Handler not found for event type '{envelope.EventType}'.";
-
-                if (processed)
+                if (shouldCommit)
                 {
                     consumer.Commit(consumeResult);
-                    continue;
                 }
-
-                await SendToDlqAndCommitAsync(consumer, dlqProducer, consumeResult, envelope,
-                    lastError ?? "Unknown processing error.", stoppingToken);
+                else
+                {
+                    // Dispatch вернул false (ошибка бизнес-логики или БД). 
+                    // Отправляем в DLQ и коммитим оригинал, чтобы разорвать бесконечный цикл повторных доставок.
+                    await SendToDlqAndCommitAsync(consumer, dlqProducer, consumeResult, envelope, "Processing failed (see dispatcher logs)", stoppingToken);
+                }
             }
             catch (ConsumeException ex)
             {
                 logger.LogError(ex, "Ошибка потребления Kafka.");
             }
-            catch (OperationCanceledException)
-                when (stoppingToken.IsCancellationRequested)
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
                 break;
             }
             catch (ProduceException<string, string> ex)
             {
-                // Не подтверждаем исходный offset, если публикация в DLQ не удалась.
-                logger.LogError(ex, "Не удалось опубликовать сообщение в DLQ. Исходный offset не подтверждён.");
+                // Если не удалось записать в DLQ, мы НЕ коммитим исходное сообщение. 
+                // Kafka доставит его снова при следующем опросе.
+                logger.LogError(ex, "Не удалось опубликовать сообщение в DLQ. Исходный offset не будет подтвержден.");
             }
             catch (Exception ex)
             {
-                logger.LogError(ex, "Необработанная ошибка DomainEventsWorker.");
+                logger.LogError(ex, "Необработанная ошибка в цикле DomainEventsWorker.");
             }
         }
     }
@@ -239,11 +174,11 @@ public sealed class DomainEventsWorker(
             },
             cancellationToken);
 
-        // Подтверждаем исходное сообщение только после успешной публикации в DLQ.
+        // 🚀 Подтверждаем исходное сообщение ТОЛЬКО после успешной публикации в DLQ
         consumer.Commit(consumeResult);
 
         logger.LogError(
-            "Сообщение отправлено в DLQ. Original topic: {Topic}, Partition: {Partition}, Offset: {Offset}, MessageId: {MessageId}, Error: {Error}",
+            "Сообщение отправлено в DLQ. Topic: {Topic}, Partition: {Partition}, Offset: {Offset}, MessageId: {MessageId}, Error: {Error}",
             consumeResult.Topic, consumeResult.Partition.Value, consumeResult.Offset.Value, envelope?.MessageId, error);
     }
 }
