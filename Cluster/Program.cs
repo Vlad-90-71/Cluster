@@ -115,6 +115,7 @@ builder.Services
 
 // 1. Регистрируем Реестр обработчиков
 builder.Services.AddScoped<DomainEventHandlerRegistry>();
+builder.Services.AddScoped<DomainEventDispatcher>();
 
 // 2. Автоматически регистрируем ВСЕ классы, реализующие IDomainEventHandler
 // (Если не используете Scrutor, можно добавить их вручную по одному)

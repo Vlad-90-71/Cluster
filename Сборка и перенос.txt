@@ -27,6 +27,9 @@ sudo patronictl -c /etc/patroni/config.yml switchover \
 sudo patronictl -c /etc/patroni/config.yml list
 
 # Log всех реплик
+docker service logs --tail 100 --timestamps mvc | sort
+
+# Log всех реплик с ожиданием новых (не завершается)
 docker service logs --follow --tail 100 --timestamps mvc
 
 # Нчало задержки

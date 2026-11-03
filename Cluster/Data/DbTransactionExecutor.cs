@@ -143,7 +143,7 @@ public static class DbTransactionExecutor
     }
 
 
-    public static async Task<TransactionExecutionResult<bool>> UpdateAsync(
+    public static async Task<TransactionExecutionResult<bool>> CompleteAsync(
         DbContext context,
         Guid idempotencyKey,
         Func<DbContext, CancellationToken, Task> operation,
@@ -235,9 +235,7 @@ public static class DbTransactionExecutor
                 ErrorMessage: ex.Message);
         }
     }
-    private static bool IsIdempotencyUniqueViolation(DbUpdateException ex)
-    {
-        return ex.Entries != null && ex.Entries.Any(entry =>
-            entry.Entity is TransactionOperation && entry.State == EntityState.Added);
-    }
+    private static bool IsIdempotencyUniqueViolation(DbUpdateException ex) =>
+        ex.Entries != null && 
+            ex.Entries.Any(entry => entry.Entity is TransactionOperation && entry.State == EntityState.Added);
 }

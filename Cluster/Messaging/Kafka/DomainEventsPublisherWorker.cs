@@ -74,6 +74,14 @@ public sealed class DomainEventsPublisherWorker(
                     {
                         logger.LogError(ex, "Ошибка публикации сообщения {IdempotencyKey} (Тип: {MessageType}). Будет повторная попытка.",
                             message.IdempotencyKey, message.MessageType);
+
+                        if (message.AttemptCount >= 5)
+                        {
+                            logger.LogCritical("Сообщение {IdempotencyKey} превысило лимит попыток ({Count}). Требуется ручное вмешательство или DLQ.",
+                                message.IdempotencyKey, message.AttemptCount);
+                            // Здесь можно было бы сделать отдельный ExecuteUpdate, чтобы пометить его как Failed, 
+                            // но для простоты можно оставить как есть: оно будет пытаться каждые 60 сек.
+                        }
                     }
                 }
 
@@ -113,7 +121,7 @@ public sealed class DomainEventsPublisherWorker(
         var claimId = Guid.NewGuid();
         var lockedUntil = now.AddSeconds(ClaimDuration);
 
-        // Получаем кандидатов на захват.
+        // ШАГ 1: Получаем кандидатов (только ID для минимизации трафика)
         var candidateIds = await dbContext.TransactionOperations
             .AsNoTracking()
             .Where(x =>
@@ -124,34 +132,29 @@ public sealed class DomainEventsPublisherWorker(
             .Take(BatchSize)
             .ToListAsync(cancellationToken);
 
-        int count = 0;
-        var claimedIds = new long[BatchSize];
+        if (candidateIds.Count == 0)
+            return [];
 
-
-        foreach (var id in candidateIds)
-        {
-            // Условное атомарное обновление.
-            var affectedRows = await dbContext.TransactionOperations
-                .Where(x => x.Id == id && !x.IsPublished && (x.ClaimId == null || x.LockedUntilUtc <= now))
-                .ExecuteUpdateAsync(setters => setters
+        // ШАГ 2: ОДИН атомарный UPDATE для всех кандидатов сразу (Решаем проблему N+1)
+        var claimedCount = await dbContext.TransactionOperations
+            .Where(x =>
+                candidateIds.Contains(x.Id) &&
+                !x.IsPublished &&
+                (x.ClaimId == null || x.LockedUntilUtc <= now))
+            .ExecuteUpdateAsync(
+                setters => setters
                     .SetProperty(x => x.ClaimId, claimId)
                     .SetProperty(x => x.LockedUntilUtc, lockedUntil)
                     .SetProperty(x => x.AttemptCount, x => x.AttemptCount + 1),
-                    cancellationToken);
+                cancellationToken);
 
-            if (affectedRows == 1)
-                claimedIds[count++] = id;
-        }
-
-        if (count == 0)
+        if (claimedCount == 0)
             return [];
 
-        var idsForQuery = count == BatchSize ? claimedIds : claimedIds.AsSpan(0, count).ToArray();
-
-        // Возвращаем только записи, захваченные текущим пакетом.
+        // ШАГ 3: Возвращаем только те записи, которые реально удалось захватить этим ClaimId
         return await dbContext.TransactionOperations
             .AsNoTracking()
-            .Where(x => x.ClaimId == claimId && idsForQuery.Contains(x.Id))
+            .Where(x => x.ClaimId == claimId)
             .OrderBy(x => x.CreatedAtUtc)
             .ToArrayAsync(cancellationToken);
     }
