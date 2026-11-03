@@ -1,6 +1,7 @@
 using Cluster.Data;
 using Cluster.Messaging.Handlers;
 using Cluster.Messaging.Kafka;
+using Cluster.Storage;
 using Confluent.Kafka;
 using Medallion.Threading;
 using Medallion.Threading.Redis;
@@ -103,6 +104,15 @@ builder.Services
 builder.Services.AddSingleton<KafkaProducer>();
 builder.Services.AddSingleton<DlqTestPublisher>();
 
+// Хранилмще
+builder.Services
+    .AddOptions<SeaweedFsOptions>()
+    .Bind(builder.Configuration.GetSection(SeaweedFsOptions.SectionName))
+    .Validate(x => x.MasterUrls.Length > 0, "SeaweedFS MasterUrls are required.")
+    .Validate(x => Uri.TryCreate(x.PublicUrl, UriKind.Absolute, out _),
+        "SeaweedFS PublicUrl is invalid.")
+    .ValidateOnStart();
+
 // 1. Регистрируем Реестр обработчиков
 builder.Services.AddScoped<DomainEventHandlerRegistry>();
 
@@ -123,6 +133,9 @@ builder.Services.AddHostedService<DomainEventsPublisherWorker>();
 
 builder.Services.AddMediatR(cfg =>
     cfg.RegisterServicesFromAssembly(typeof(Program).Assembly));
+
+builder.Services.AddHttpClient();
+builder.Services.AddScoped<SeaweedFsClient>();
 
 // Add services to the container.
 builder.Services.AddControllersWithViews();

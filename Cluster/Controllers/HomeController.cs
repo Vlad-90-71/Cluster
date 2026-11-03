@@ -1,6 +1,8 @@
 using Cluster.Messaging.Kafka;
 using Cluster.Models;
+using Cluster.Storage;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
 using System.Diagnostics;
 
 namespace Cluster.Controllers
@@ -9,13 +11,17 @@ namespace Cluster.Controllers
         IWebHostEnvironment env, 
         ILogger<HomeController> logger,
         KafkaProducer kafkaProducer,
-        DlqTestPublisher dlqTestPublisher) : Controller
+        DlqTestPublisher dlqTestPublisher,
+        SeaweedFsClient seaweedFsClient,
+        IOptions<SeaweedFsOptions> seaweedFsOptions) : Controller
     {
         private readonly IWebHostEnvironment _env = env;
         private readonly ILogger<HomeController> _logger = logger;
         
         private readonly KafkaProducer _kafkaProducer = kafkaProducer;
         private readonly DlqTestPublisher _dlqTestPublisher = dlqTestPublisher;
+        private readonly SeaweedFsClient _seaweedFsClient = seaweedFsClient;
+        private readonly string _seaweedFsPublicUrl = seaweedFsOptions.Value.PublicUrl;
 
         public IActionResult Index()
         {
@@ -55,25 +61,41 @@ namespace Cluster.Controllers
             return Ok("Тестовое сообщение отправлено в DomainEvents.");
         }
 
+
         [HttpPost]
-        public async Task<IActionResult> UploadFile(IFormFile file)
+        [RequestSizeLimit(100 * 1024 * 1024)]
+        public async Task<IActionResult> UploadFile(
+            IFormFile file,
+            CancellationToken cancellationToken)
         {
             if (file == null || file.Length == 0)
-                return Content("Файл не выбран");
+                return BadRequest("Файл не выбран.");
 
-            var uploadsFolder = Path.Combine(_env.WebRootPath, "uploads");
+            try
+            {
+                var fid = await _seaweedFsClient.UploadAsync(file, cancellationToken);
 
-            Directory.CreateDirectory(uploadsFolder);
+                var downloadUrl =
+                    $"{_seaweedFsPublicUrl.TrimEnd('/')}/{fid}";
 
-            // Генерируем уникальное имя, сохраняя расширение файла.
-            var extension = Path.GetExtension(Path.GetFileName(file.FileName));
-            var fileName = $"{Guid.NewGuid():N}{extension}";
-            var filePath = Path.Combine(uploadsFolder, fileName);
+                return Ok(new
+                {
+                    Message = "Файл успешно загружен в SeaweedFS!",
+                    FileId = fid,
+                    file.FileName,
+                    file.ContentType,
+                    FileSize = file.Length,
+                    DownloadUrl = downloadUrl
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка загрузки файла в SeaweedFS.");
 
-            await using (var stream = new FileStream(filePath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-                await file.CopyToAsync(stream);
-
-            return Content($"Файл успешно загружен! Ссылка: /uploads/{fileName}");
+                return Problem(
+                    title: "Не удалось загрузить файл в SeaweedFS.",
+                    statusCode: StatusCodes.Status502BadGateway);
+            }
         }
 
         [ResponseCache(Duration = 0, Location = ResponseCacheLocation.None, NoStore = true)]
