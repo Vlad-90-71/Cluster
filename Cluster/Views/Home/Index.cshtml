@@ -4,20 +4,283 @@
 
 <div class="text-center">
     <h1 class="display-4">Welcome</h1>
-    <p>Learn about <a href="https://learn.microsoft.com/aspnet/core">building Web apps with ASP.NET Core</a>.</p>
+    <p>
+        Learn about
+        <a href="https://learn.microsoft.com/aspnet/core">
+            building Web apps with ASP.NET Core
+        </a>.
+    </p>
 </div>
 
 <div class="text-center" style="margin-top: 50px;">
     <h2>Тестирование распределенного хранилища CRM</h2>
-    <p>Файл загрузится на любую ноду Swarm, запишется на СХД-2, а Nginx отдаст его напрямую.</p>
 
-    <!-- Форма отправки файла -->
-    <form asp-action="UploadFile" asp-controller="Home" method="post" enctype="multipart/form-data" style="margin: 30px auto; max-width: 400px; padding: 20px; border: 1px solid #ccc; border-radius: 8px;">
+    <p>
+        Файл загрузится на любую ноду Swarm, запишется на СХД-2,
+        а Nginx отдаст его напрямую.
+    </p>
+
+    <div style="
+        margin: 30px auto;
+        max-width: 500px;
+        padding: 20px;
+        border: 1px solid #ccc;
+        border-radius: 8px;">
+
+        <input type="hidden"
+               id="uploadId"
+               value="@ViewData["UploadId"]" />
+
         <div style="margin-bottom: 15px;">
-            <input type="file" name="file" class="form-control" required />
+            <input type="file"
+                   id="fileInput"
+                   class="form-control" />
         </div>
-        <button type="submit" style="background-color: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer;">
+
+        <button type="button"
+                id="uploadButton"
+                style="
+            background-color: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;">
             Загрузить файл в кластер
         </button>
-    </form>
+
+        <div style="margin-top: 20px;">
+            <progress id="uploadProgress"
+                      value="0"
+                      max="100"
+                      style="width: 100%; height: 22px;">
+            </progress>
+
+            <p id="progressText">Ожидание загрузки</p>
+            <p id="statusText"></p>
+            <p id="downloadContainer"></p>
+        </div>
+    </div>
 </div>
+
+@section Scripts {
+    <script>
+        const fileInput = document.getElementById("fileInput");
+        const uploadButton = document.getElementById("uploadButton");
+        const uploadProgress = document.getElementById("uploadProgress");
+        const progressText = document.getElementById("progressText");
+        const statusText = document.getElementById("statusText");
+        const downloadContainer = document.getElementById("downloadContainer");
+
+        const chunkSize = 4 * 1024 * 1024;
+        const maxRetries = 5;
+
+        const delay = ms =>
+            new Promise(resolve => setTimeout(resolve, ms));
+
+        function updateProgress(offset, length) {
+            const percent = length === 0
+                ? 0
+                : Math.round(offset / length * 100);
+
+            uploadProgress.value = percent;
+            progressText.textContent =
+                `${percent}% (${formatBytes(offset)} / ${formatBytes(length)})`;
+        }
+
+        function formatBytes(bytes) {
+            if (bytes < 1024)
+                return `${bytes} Б`;
+
+            if (bytes < 1024 * 1024)
+                return `${(bytes / 1024).toFixed(1)} КБ`;
+
+            return `${(bytes / 1024 / 1024).toFixed(2)} МБ`;
+        }
+
+        async function getProgress(location) {
+            const url =
+                `/Home/UploadProgress?location=${encodeURIComponent(location)}`;
+
+            const response = await fetch(url);
+
+            if (!response.ok)
+                throw new Error(`Проверка прогресса: HTTP ${response.status}`);
+
+            return await response.json();
+        }
+
+        async function uploadChunk(location, offset, chunk) {
+            const url =
+                `/Home/UploadChunk?location=${encodeURIComponent(location)}` +
+                `&offset=${offset}`;
+
+            return await fetch(url, {
+                method: "PATCH",
+                headers: {
+                    "Content-Type": "application/offset+octet-stream"
+                },
+                body: chunk
+            });
+        }
+
+        async function createUpload(file, uploadId) {
+            const response = await fetch("/Home/CreateUpload", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    uploadId: uploadId,
+                    fileName: file.name,
+                    fileLength: file.size
+                })
+            });
+
+            if (!response.ok) {
+                throw new Error(
+                    `Создание TUS-сессии: HTTP ${response.status}`);
+            }
+
+            return await response.json();
+        }
+
+        async function uploadFile() {
+            const file = fileInput.files[0];
+
+            if (!file) {
+                alert("Выберите файл.");
+                return;
+            }
+
+            if (file.size === 0) {
+                alert("Файл пустой.");
+                return;
+            }
+
+            if (file.size > 100 * 1024 * 1024) {
+                alert("Максимальный размер файла — 100 МБ.");
+                return;
+            }
+
+            uploadButton.disabled = true;
+            fileInput.disabled = true;
+            downloadContainer.innerHTML = "";
+            uploadProgress.value = 0;
+
+            try {
+                statusText.textContent = "Создание TUS-сессии...";
+
+                const uploadId =
+                    document.getElementById("uploadId").value;
+
+                const session = await createUpload(file, uploadId);
+
+                const location = session.location;
+                const length = session.length;
+
+                statusText.textContent =
+                    "TUS-сессия создана. Начинаем загрузку...";
+
+                let progress = await getProgress(location);
+                let offset = progress.offset;
+
+                if (progress.length !== file.size) {
+                    throw new Error(
+                        "Размер файла не совпадает с размером TUS-сессии.");
+                }
+
+                updateProgress(offset, length);
+
+                while (offset < length) {
+                    const end = Math.min(offset + chunkSize, length);
+                    const chunk = file.slice(offset, end);
+
+                    let uploaded = false;
+
+                    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                        try {
+                            statusText.textContent =
+                                `Отправка фрагмента. Попытка ${attempt}/${maxRetries}`;
+
+                            const response =
+                                await uploadChunk(location, offset, chunk);
+
+                            if (!response.ok) {
+                                throw new Error(
+                                    `PATCH: HTTP ${response.status}`);
+                            }
+
+                            const result = await response.json();
+
+                            if (result.offset <= offset) {
+                                throw new Error(
+                                    "Смещение загрузки не изменилось.");
+                            }
+
+                            offset = result.offset;
+                            uploaded = true;
+
+                            break;
+                        }
+                        catch (error) {
+                            statusText.textContent =
+                                `Ошибка передачи. Проверяем прогресс...`;
+
+                            const current = await getProgress(location);
+
+                            offset = current.offset;
+
+                            updateProgress(offset, length);
+
+                            if (offset >= end) {
+                                uploaded = true;
+                                break;
+                            }
+
+                            if (offset > end) {
+                                uploaded = true;
+                                break;
+                            }
+
+                            if (attempt === maxRetries) {
+                                throw error;
+                            }
+
+                            await delay(1000 * attempt);
+                        }
+                    }
+
+                    if (!uploaded) {
+                        throw new Error(
+                            "Не удалось отправить фрагмент файла.");
+                    }
+
+                    updateProgress(offset, length);
+                }
+
+                statusText.textContent =
+                    "Файл успешно загружен в SeaweedFS!";
+
+                uploadProgress.value = 100;
+
+                downloadContainer.innerHTML =
+                    `<a href="${session.downloadUrl}" target="_blank">
+                        Скачать загруженный файл
+                    </a>`;
+            }
+            catch (error) {
+                console.error(error);
+
+                statusText.textContent =
+                    `Ошибка загрузки: ${error.message}`;
+            }
+            finally {
+                uploadButton.disabled = false;
+                fileInput.disabled = false;
+            }
+        }
+
+        uploadButton.addEventListener("click", uploadFile);
+    </script>
+}

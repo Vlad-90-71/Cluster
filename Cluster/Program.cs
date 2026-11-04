@@ -108,7 +108,7 @@ builder.Services.AddSingleton<DlqTestPublisher>();
 builder.Services
     .AddOptions<SeaweedFsOptions>()
     .Bind(builder.Configuration.GetSection(SeaweedFsOptions.SectionName))
-    .Validate(x => x.MasterUrls.Length > 0, "SeaweedFS MasterUrls are required.")
+    .Validate(x => x.FilerUrls.Length > 0, "SeaweedFS FilerUrls are required.")
     .Validate(x => Uri.TryCreate(x.PublicUrl, UriKind.Absolute, out _),
         "SeaweedFS PublicUrl is invalid.")
     .ValidateOnStart();
