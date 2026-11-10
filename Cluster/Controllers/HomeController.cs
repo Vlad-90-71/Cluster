@@ -158,41 +158,27 @@ namespace Cluster.Controllers
             if (offset < 0)
                 return BadRequest("Некорректное смещение.");
 
-            if (Request.ContentLength is not long chunkLength || chunkLength <= 0 || chunkLength > 4 * 1024 * 1024)
+            if (Request.ContentLength is not long chunkLength ||
+                chunkLength <= 0 ||
+                chunkLength > 4 * 1024 * 1024)
+            {
                 return BadRequest("Недопустимый размер части файла.");
+            }
 
             try
             {
-                // Сначала узнаём актуальное состояние сессии.
-                // Это также позволяет выбрать доступную Filer.
-                var progress = await _seaweedFsClient.GetTusProgressAsync(location, cancellationToken);
-
-                if (offset != progress.Offset)
-                {
-                    return Conflict(new
-                    {
-                        Message = "Смещение загрузки изменилось.",
-                        CurrentOffset = progress.Offset,
-                        progress.Length
-                    });
-                }
-
-                if (offset + chunkLength > progress.Length)
-                    return BadRequest("Размер части превышает оставшийся размер файла.");
-
-                var newOffset = await _seaweedFsClient.UploadTusChunkAsync(
+                var progress = await _seaweedFsClient.UploadTusChunkAsync(
                     location,
                     offset,
                     Request.Body,
                     chunkLength,
-                    progress.FilerUrl,
                     cancellationToken);
 
                 return Ok(new
                 {
-                    Offset = newOffset,
+                    progress.Offset,
                     progress.Length,
-                    IsCompleted = newOffset == progress.Length
+                    IsCompleted = progress.Offset == progress.Length
                 });
             }
             catch (OperationCanceledException)
@@ -202,16 +188,20 @@ namespace Cluster.Controllers
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex,
+                _logger.LogError(
+                    ex,
                     "Ошибка передачи части TUS-загрузки. Offset: {Offset}",
                     offset);
 
-                // PATCH мог пройти на сервере, но ответ мог потеряться.
-                // Поэтому проверяем фактическое смещение перед ответом клиенту.
+                // PATCH мог быть принят Filer, даже если ответ потерялся.
+                // Поэтому проверяем фактическое состояние сессии.
                 try
                 {
-                    var progress = await _seaweedFsClient.GetTusProgressAsync(location, cancellationToken);
+                    var progress = await _seaweedFsClient.GetTusProgressAsync(
+                        location,
+                        cancellationToken);
 
+                    // Чанк уже принят — повторно отправлять его нельзя.
                     if (progress.Offset == offset + chunkLength)
                     {
                         return Ok(new
@@ -222,14 +212,18 @@ namespace Cluster.Controllers
                         });
                     }
 
-                    return StatusCode(
-                        StatusCodes.Status502BadGateway,
-                        new
-                        {
-                            Message = "Не удалось передать часть файла.",
-                            CurrentOffset = progress.Offset,
-                            progress.Length
-                        });
+                    // Смещение не изменилось или отличается от ожидаемого.
+                    return Conflict(new
+                    {
+                        Message = "Не удалось подтвердить передачу части файла.",
+                        CurrentOffset = progress.Offset,
+                        progress.Length
+                    });
+                }
+                catch (OperationCanceledException)
+                    when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
                 }
                 catch (Exception progressException)
                 {

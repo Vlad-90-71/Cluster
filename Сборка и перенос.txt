@@ -19,8 +19,8 @@ sudo docker service update --force --image cluster:latest mvc
 
 # Смена мастера
 sudo patronictl -c /etc/patroni/config.yml switchover \
-  --master vm-db \
-  --candidate vm-app \
+  --master vm-app \
+  --candidate vm-db \
   --force
 
 # Роли серверов
